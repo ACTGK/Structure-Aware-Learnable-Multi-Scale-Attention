@@ -1,0 +1,1420 @@
+"""
+# Adapted from: https://github.com/milesial/Pytorch-UNet
+
+# ------------------------------------------------------------
+# ORIGINAL COPYRIGHT:
+# U-Net Implementation
+# Copyright (c) 2018 Milesial
+# Licensed under the MIT License
+# ------------------------------------------------------------
+#
+# ------------------------------------------------------------------
+# Project: Structure Aware Learnable Multi-Scale Attention for Retinal Vessel Analysis
+# Description of Modifications:
+# 1. Integrated Structure Aware Learnable Multi-Scale Attention (LMSA) block at the shallow/early stage.
+# 2. Implemented Multi-Task Learning (MTL) heads for simultaneous auxiliary tasks.
+# ------------------------------------------------------------------
+"""
+# ==================================================================
+#    USER CONFIGURATION (MASTER CONTROL PANEL)
+# ==================================================================
+class Config:
+    # 1. ARCHITECTURE SETTINGS
+    USE_LMSA_MODULE = True      # Set False for Standard U-Net Baseline
+    USE_MTL_HEAD    = True      # Set False for Single-Task Learning only
+    
+    # 2. LMSA HYPERPARAMETERS
+    LMSA_K          = 5         # Number of scales
+    LMSA_SIGMA_MIN  = 0.1
+    LMSA_SIGMA_MAX  = 1.0
+
+    # 3. LOSS WEIGHTS (MTL)
+    # Applied only if USE_MTL_HEAD is True
+    LAMBDA_BOUNDARY   = 0.5
+    LAMBDA_CENTERLINE = 0.5
+
+    # 4. TRAINING SETTINGS
+    BATCH_SIZE      = 16
+    EPOCHS          = 50
+    LEARNING_RATE   = 1e-4
+    PATCH_SIZE      = 256
+    
+    # 5. DATASET PATH (SINGLE ROOT)
+    # Point this to the root folder of your dataset (e.g., DRIVE or CHASE_DB1).
+    # The script expects subfolders: Train/images, Train/mask, Test/images, Test/mask
+    DATASET_ROOT    = './CDS/DRIVE_dataset'
+    
+# ==================================================================
+#   END CONFIGURATION
+# ==================================================================
+
+import os, math, time, random, csv
+import numpy as np
+from pathlib import Path
+from datetime import datetime
+from PIL import Image
+import cv2
+from typing import Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from sklearn.metrics import roc_auc_score, matthews_corrcoef, roc_curve, auc
+from skimage.morphology import skeletonize 
+import matplotlib.pyplot as plt
+
+# Initialize BCE loss globally (used in multiple loss calculations)
+bce = nn.BCEWithLogitsLoss()
+
+# ======================================================================================
+# Utilities
+# ======================================================================================
+
+def set_seed(seed=42):
+    """Sets the seed for reproducibility across CPU and GPU."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed) 
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+# ======================================================================================
+# Learnable Multi-Scale Sato-Frangi Attention (LMSA) - HYBRID
+# ======================================================================================
+class TopologyAwareLMSA(nn.Module):
+    """
+    TL-LMSA with hybrid vesselness and
+    the ORIGINAL nn.Sequential scale_gate.
+    """
+
+    def __init__(self,
+                 in_channels: int,
+                 K: int = 5,
+                 sigma_min: float = 0.1,
+                 sigma_max: float = 1.0,
+                 black_ridges: bool = True,
+                 gain_init: float = 0.1,
+                 beta_init: float = 5.0,
+                 tau_init: float = 0.5,
+                 scale_gamma: float = -1.0,
+                 gate_hidden: int = 32,
+                 use_dropout_gate: bool = True,
+                 dropout_p: float = 0.3,
+                 use_multichannel_gate: bool = True,
+                 use_multiplicative_attention: bool = False,
+                 topology_mode: str = "scalar"):  # "scalar" or "conv"
+        super().__init__()
+        assert sigma_max > sigma_min > 0
+        self.K = K
+        self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
+        self.black_ridges = black_ridges
+        self.scale_gamma = scale_gamma
+        self.use_multichannel_gate = use_multichannel_gate
+        self.use_multiplicative_attention = use_multiplicative_attention
+        self.topology_mode = topology_mode
+
+        # ---- learnable sigmas via positive deltas (stable ordering)
+        init_deltas = torch.linspace(-5.0, 5.0, self.K)
+        self.delta_logits = nn.Parameter(init_deltas)
+
+        # ---- projection to single-channel guide
+        self.proj = nn.Conv2d(in_channels, 1, kernel_size=1, bias=True)
+
+        # ---- scale-selection gate (REVERTED to original nn.Sequential)
+        gate_in = in_channels if self.use_multichannel_gate else 1
+        
+        self.scale_gate = nn.Sequential(
+            nn.Conv2d(gate_in, gate_hidden, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(p=dropout_p) if use_dropout_gate else nn.Identity(),
+            nn.Conv2d(gate_hidden, self.K, 1)
+        )
+
+        # ---- trainable attention params
+        self.gamma = nn.Parameter(torch.tensor(gain_init))
+        self.beta  = nn.Parameter(torch.tensor(beta_init))
+        self.tau   = nn.Parameter(torch.tensor(tau_init))
+
+        # ----- Learnable topology weighting -----
+        if topology_mode == "scalar":
+            self.coherence_gain = nn.Parameter(torch.tensor(0.5))
+        elif topology_mode == "conv":
+            self.coherence_gate = nn.Sequential(
+                nn.Conv2d(1, 8, 3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(8, 1, 1),
+                nn.Sigmoid()
+            )
+        else:
+            raise ValueError("topology_mode must be 'scalar' or 'conv'")
+
+    # --------------------------------------------------------------------------
+    def current_sigmas(self):
+        """Monotonic, learnable sigma sequence in [sigma_min, sigma_max]."""
+        deltas = F.softplus(self.delta_logits) + 1e-4
+        s = torch.cumsum(deltas, dim=0)
+        sK = s[-1]
+        sigmas = self.sigma_min + (s / sK) * (self.sigma_max - self.sigma_min)
+        return sigmas
+
+    @staticmethod
+    def _kernel_size_for_sigma(sigma):
+        """Odd kernel size ~ 6σ."""
+        k = int(math.ceil(6 * float(sigma))) | 1
+        return max(3, k)
+
+    def _make_hessian_kernels(self, sigma, device, dtype):
+        """Second-derivative of Gaussian filters at scale σ."""
+        k = self._kernel_size_for_sigma(float(sigma.detach()))
+        r = (k - 1) // 2
+        y, x = torch.meshgrid(
+            torch.arange(-r, r + 1, device=device, dtype=dtype),
+            torch.arange(-r, r + 1, device=device, dtype=dtype),
+            indexing='ij'
+        )
+        s2 = sigma * sigma
+        g = torch.exp(-(x**2 + y**2) / (2 * s2)) / (2 * math.pi * s2)
+        Gxx = ((x * x / s2**2) - (1.0 / s2)) * g
+        Gyy = ((y * y / s2**2) - (1.0 / s2)) * g
+        Gxy = ((x * y / s2**2)) * g
+
+        # zero-mean to avoid bias
+        Gxx -= Gxx.mean(); Gyy -= Gyy.mean(); Gxy -= Gxy.mean()
+
+        def K(t): return t.unsqueeze(0).unsqueeze(0)
+        return K(Gxx), K(Gxy), K(Gyy)
+
+    def _hessian(self, guide, sigma):
+        """Convolve guide with Hessian-of-Gaussian to get Axx, Axy, Ayy."""
+        Gxx, Gxy, Gyy = self._make_hessian_kernels(sigma, guide.device, guide.dtype)
+        pad = (Gxx.shape[-1] // 2,) * 4  # (L,R,T,B)
+        Axx = F.conv2d(F.pad(guide, pad, mode='reflect'), Gxx)
+        Axy = F.conv2d(F.pad(guide, pad, mode='reflect'), Gxy)
+        Ayy = F.conv2d(F.pad(guide, pad, mode='reflect'), Gyy)
+        return Axx, Axy, Ayy
+
+    # ----------------------- HYBRID VESSELNESS (½ Sato + ½ Frangi) ---------------------
+    def _sato_tubeness(self, Axx, Axy, Ayy, sigma=None):
+        """
+        Computes a hybrid vesselness combining Sato and Frangi responses:
+            V_hybrid = 0.5 * V_sato + 0.5 * V_frangi
+        """
+        # eigenvalues of 2x2 Hessian
+        trace = Axx + Ayy
+        det = Axx * Ayy - Axy * Axy
+        tmp = torch.clamp(trace * trace - 4.0 * det, min=0.0)
+        delta = torch.sqrt(tmp + 1e-12)
+        lam1 = 0.5 * (trace - delta)  # smaller-magnitude eigenvalue
+        lam2 = 0.5 * (trace + delta)  # larger-magnitude eigenvalue
+
+        # --- Sato tubeness (simple structural term)
+        sato = torch.relu(-lam1) if self.black_ridges else torch.relu(lam2)
+
+        # --- Frangi vesselness (ratio + magnitude)
+        eps = 1e-6
+        Rb = torch.abs(lam1) / (torch.abs(lam2) + eps)
+        S = torch.sqrt(lam1**2 + lam2**2)
+        beta, c = 0.5, 15.0  # typical starting values; can be tuned/made learnable
+        frangi = torch.exp(-(Rb**2) / (2 * beta**2)) * (1 - torch.exp(-(S**2) / (2 * c**2)))
+
+        # keep correct ridge polarity
+        if self.black_ridges:
+            frangi = frangi * (lam2 < 0).float()
+        else:
+            frangi = frangi * (lam2 > 0).float()
+
+        # --- hybrid mean for stability
+        hybrid = 0.5* sato + 0.5* frangi
+
+        # optional scale normalization
+        if self.scale_gamma != 0.0 and sigma is not None:
+            hybrid = hybrid * (sigma ** self.scale_gamma)
+
+        return hybrid
+
+    # --------------------------------------------------------------------------
+    @staticmethod
+    def _minmax(x, eps=1e-6):
+        xmin = torch.amin(x, dim=(2, 3), keepdim=True)
+        xmax = torch.amax(x, dim=(2, 3), keepdim=True)
+        return (x - xmin) / (xmax - xmin + eps)
+
+    # --------------------------------------------------------------------------
+    def forward(self, x, guide=None):
+        """Returns the attended feature map y."""
+        # 1) Guide normalization (z-score)
+        if guide is None:
+            guide = self.proj(x)
+        g = (guide - guide.mean(dim=(2,3), keepdim=True)) / (guide.std(dim=(2,3), keepdim=True) + 1e-6)
+
+        gate_in = x if self.use_multichannel_gate else g
+
+        # 2) Multi-scale hybrid vesselness
+        sigmas = self.current_sigmas()
+        tub_list = []
+        for s in sigmas:
+            Axx, Axy, Ayy = self._hessian(g, s)
+            tub = self._sato_tubeness(Axx, Axy, Ayy, sigma=s)  # <-- hybrid inside
+            tub_list.append(tub)
+        T_all = torch.cat(tub_list, dim=1)  # [B, K, H, W]
+
+        # 3) Scale weighting (softmax-gated mixture across K scales)
+        logits = self.scale_gate(gate_in) # <--- Uses ORIGINAL gate
+        if logits.shape[2:] != T_all.shape[2:]:
+            logits = F.interpolate(logits, size=T_all.shape[2:], mode='nearest')
+        tau = torch.clamp(self.tau, 0.05, 5.0)
+        alpha = torch.softmax(logits / tau, dim=1)              # [B, K, H, W]
+        T_ms = (alpha * T_all).sum(dim=1, keepdim=True)         # [B, 1, H, W]
+
+        # 4) Directional coherence weighting (topological awareness)
+        #    (Sobel gradients -> structure tensor -> coherence)
+        sobel_x = torch.tensor([[-1,0,1],[-2,0,2],[-1,0,1]], device=g.device, dtype=g.dtype).unsqueeze(0).unsqueeze(0)
+        sobel_y = sobel_x.transpose(2,3)
+        Ix = F.conv2d(g, sobel_x, padding=1)
+        Iy = F.conv2d(g, sobel_y, padding=1)
+        Jxx, Jxy, Jyy = Ix*Ix, Ix*Iy, Iy*Iy
+        tmp = torch.sqrt((Jxx - Jyy)**2 + 4.0*Jxy**2 + 1e-12)
+        lam1 = 0.5*(Jxx + Jyy + tmp)
+        lam2 = 0.5*(Jxx + Jyy - tmp)
+        coherence = (lam1 - lam2) / (lam1 + lam2 + 1e-6)  # in [0,1]-ish
+
+        if self.topology_mode == "scalar":
+            T_ms = T_ms * (1.0 + self.coherence_gain * coherence)
+        else:  # "conv"
+            Cw = self.coherence_gate(coherence)  # [0,1]
+            T_ms = T_ms * (1.0 + Cw)
+
+        # 5) Attention map & fusion
+        Tn = self._minmax(T_ms)
+        A = torch.sigmoid(self.beta * (Tn - 0.5))
+
+        if self.use_multiplicative_attention:
+            y = x * (1.0 + self.gamma * A)
+        else:
+            y = x + self.gamma * A
+
+        return y
+
+
+# ======================================================================================
+# U-Net blocks
+# ======================================================================================
+class DoubleConv(nn.Module):
+    def __init__(self, in_ch, out_ch, dilation=1, use_dropout=False, dropout_p=0.3):
+        super().__init__()
+        layers = [
+            nn.Conv2d(in_ch, out_ch, 3, padding=dilation, dilation=dilation, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        ]
+        if use_dropout:
+            layers.append(nn.Dropout2d(dropout_p))
+        layers += [
+            nn.Conv2d(out_ch, out_ch, 3, padding=dilation, dilation=dilation, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        ]
+        if use_dropout:
+            layers.append(nn.Dropout2d(dropout_p))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+# ======================================================================================
+# UNetLSAM_Boundary (Conditional Multi-Head)
+# ======================================================================================
+class UNetLSAM_Boundary(nn.Module):
+    """
+    U-Net with LMSA toggle on input and CONDITIONAL output heads (Mask, Boundary, Centerline).
+    """
+    def __init__(self, in_ch=1, out_ch=1, base=64,
+                 use_lsam=True, # Single LSAM toggle (applies to encoder input)
+                 K=5, sigma_min=0.6, sigma_max=5.0, black_ridges=True,
+                 lsam_use_dropout_gate=False, lsam_dropout_p=0.3,
+                 lsam_use_multichannel_gate=False,
+                 lsam_gate_hidden=32,
+                 lsam_use_multiplicative_attention=False,
+                 lsam_topology_mode="scalar",
+                 dropout_p=0.3,
+                 build_mtl_heads=True): # ARCHITECTURE TOGGLE
+        super().__init__()
+        self.use_lsam = use_lsam
+        self.build_mtl_heads = build_mtl_heads
+
+        if self.use_lsam:
+            # LSAM applied only to the input image (encoder input)
+            self.lsam_enc = TopologyAwareLMSA(
+                in_channels=in_ch, K=K, sigma_min=sigma_min, sigma_max=sigma_max,
+                black_ridges=black_ridges, use_dropout_gate=lsam_use_dropout_gate,
+                dropout_p=lsam_dropout_p,
+                use_multichannel_gate=lsam_use_multichannel_gate,
+                gate_hidden=lsam_gate_hidden,
+                use_multiplicative_attention=lsam_use_multiplicative_attention,
+                topology_mode=lsam_topology_mode
+            )
+
+        # Encoder
+        self.inc   = DoubleConv(in_ch, base, use_dropout=False, dropout_p=dropout_p)
+        self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(base, base*2, use_dropout=False, dropout_p=dropout_p))
+        self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(base*2, base*4, use_dropout=True, dropout_p=dropout_p))
+        self.down3 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(base*4, base*8, use_dropout=True, dropout_p=dropout_p))
+
+        # Bottleneck
+        self.down4 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(base*8, base*16, use_dropout=True, dropout_p=dropout_p))
+
+        # Decoder
+        self.up1 = nn.ConvTranspose2d(base*16, base*8, 2, stride=2)
+        self.dec1 = DoubleConv(base*16, base*8, use_dropout=True, dropout_p=dropout_p)
+
+        self.up2 = nn.ConvTranspose2d(base*8, base*4, 2, stride=2)
+        self.dec2 = DoubleConv(base*8, base*4, use_dropout=True, dropout_p=dropout_p)
+
+        self.up3 = nn.ConvTranspose2d(base*4, base*2, 2, stride=2)
+        self.dec3 = DoubleConv(base*4, base*2, use_dropout=False, dropout_p=dropout_p)
+
+        self.up4 = nn.ConvTranspose2d(base*2, base, 2, stride=2)
+        self.dec4 = DoubleConv(base*2, base, use_dropout=False, dropout_p=dropout_p)
+
+        # Head (Mask) - Always present
+        self.out_mask = nn.Conv2d(base, out_ch, 1)
+        
+        # ===============================================
+        #  Modification: MTL Heads
+        # ===============================================
+        # Conditional MTL Heads
+        if self.build_mtl_heads:
+            self.out_boundary = nn.Conv2d(base, out_ch, 1)
+            self.out_centerline = nn.Conv2d(base, out_ch, 1)
+        else:
+            self.out_boundary = None
+            self.out_centerline = None
+
+    def forward(self, x):
+        if self.use_lsam:
+            # LSAM applied to the input
+            x = self.lsam_enc(x)
+
+        # Encoder path
+        x1 = self.inc(x)
+        x2 = self.down1(x1)
+        x3 = self.down2(x2)
+        x4 = self.down3(x3)
+        xb = self.down4(x4)
+
+        # Decoder path
+        u1 = self.up1(xb)
+        u1 = torch.cat([u1, x4], dim=1)
+        u1 = self.dec1(u1)
+
+        u2 = self.up2(u1)
+        u2 = torch.cat([u2, x3], dim=1)
+        u2 = self.dec2(u2)
+
+        u3 = self.up3(u2)
+        u3 = torch.cat([u3, x2], dim=1)
+        u3 = self.dec3(u3)
+
+        u4 = self.up4(u3)
+        u4 = torch.cat([u4, x1], dim=1)
+        u4 = self.dec4(u4)
+
+        mask_logits = self.out_mask(u4)
+        
+        # Return logits or None placeholders
+        boundary_logits = self.out_boundary(u4) if self.out_boundary is not None else None
+        centerline_logits = self.out_centerline(u4) if self.out_centerline is not None else None
+        
+        return mask_logits, boundary_logits, centerline_logits
+
+# ======================================================================================
+# Preprocessing
+# ======================================================================================
+
+def preprocess_green_clahe(img_rgb: Image.Image, invert=True, clip_limit=2.0, tile_size=8):
+    """Extracts green channel, applies CLAHE, and optionally inverts."""
+    _, g, _ = img_rgb.split()
+    g_np = np.array(g)
+    clahe = cv2.createCLAHE(clipLimit=float(clip_limit), tileGridSize=(int(tile_size), int(tile_size)))
+    g_clahe = clahe.apply(g_np)
+    if invert:
+        g_clahe = 255 - g_clahe
+    return g_clahe
+
+def compute_dataset_mean_std(image_dir, file_list, invert=True, clip_limit=2.0, tile_size=8):
+    """Computes mean and std deviation across the dataset images."""
+    s = 0.0; ss = 0.0; n = 0
+    for fn in file_list:
+        img_rgb = Image.open(Path(image_dir)/fn).convert('RGB')
+        g = preprocess_green_clahe(img_rgb, invert=invert, clip_limit=clip_limit, tile_size=tile_size)
+        arr = g.astype(np.float32) / 255.0
+        s  += arr.mean()
+        ss += (arr**2).mean()
+        n  += 1
+    mean = s / max(n,1)
+    var  = ss / max(n,1) - mean**2
+    std  = float(np.sqrt(max(var, 1e-12)))
+    return float(mean), float(std)
+
+# ======================================================================================
+# Dataset
+# ======================================================================================
+class PatchSegmentationDataset(Dataset):
+    def __init__(self,
+                 image_dir, mask_dir, image_filenames,
+                 patch_size=128, patches_per_image=50,
+                 invert=True, clip_limit=2.0, tile_size=8,
+                 norm_mode="none",
+                 mean_val=0.0, std_val=1.0,
+                 centerline_power=1.0,
+                 use_geometric_augmentation=True,
+                 use_intensity_augmentation=True,
+                 use_scale_jitter=True):
+        self.image_dir = Path(image_dir)
+        self.mask_dir  = Path(mask_dir)
+        self.patch_size = int(patch_size)
+        self.invert = bool(invert)
+        self.clip_limit = float(clip_limit)
+        self.tile_size  = int(tile_size)
+        self.norm_mode  = norm_mode
+        self.mean_val   = float(mean_val)
+        self.std_val    = float(std_val)
+        self.centerline_power = float(centerline_power)
+        
+        self.use_geometric_augmentation = bool(use_geometric_augmentation)
+        self.use_intensity_augmentation = bool(use_intensity_augmentation)
+        self.use_scale_jitter = bool(use_scale_jitter)
+        
+        self.images, self.masks, self.weights = [], [], []
+        for fn in image_filenames:
+            img_rgb = Image.open(self.image_dir / fn).convert('RGB')
+            image = preprocess_green_clahe(img_rgb, invert=self.invert,
+                                           clip_limit=self.clip_limit, tile_size=self.tile_size)
+            
+            mask_path = self.mask_dir / fn
+            if not mask_path.exists():
+                stem = mask_path.stem
+                if (self.mask_dir / (stem + '.png')).exists():
+                    mask_path = self.mask_dir / (stem + '.png')
+                elif (self.mask_dir / (stem + '.tif')).exists():
+                    mask_path = self.mask_dir / (stem + '.tif')
+
+            mask = np.array(Image.open(mask_path).convert('L'))
+            mask = (mask > 20).astype(np.uint8) # Binarize mask
+            
+            # Centerline Weight Calculation
+            dist = cv2.distanceTransform((mask*255).astype(np.uint8), cv2.DIST_L2, 3)
+            if dist.max() > 0: dist = dist / dist.max()
+            dist = np.power(dist, self.centerline_power)
+            
+            self.images.append(image)
+            self.masks.append(mask)
+            self.weights.append(dist)
+
+        self.indices = [i for i in range(len(self.images)) for _ in range(int(patches_per_image))]
+
+    def __len__(self): return len(self.indices)
+
+    def __getitem__(self, idx):
+        i = self.indices[idx]
+        img = self.images[i]
+        msk = self.masks[i]
+        wgt = self.weights[i]
+        
+        h, w = img.shape
+        ps = self.patch_size
+
+        if h < ps or w < ps:
+            img = cv2.copyMakeBorder(img, 0, max(0, ps - h), 0, max(0, ps - w), cv2.BORDER_REFLECT_101)
+            msk = cv2.copyMakeBorder(msk, 0, max(0, ps - h), 0, max(0, ps - w), cv2.BORDER_CONSTANT, value=0)
+            wgt = cv2.copyMakeBorder(wgt, 0, max(0, ps - h), 0, max(0, ps - w), cv2.BORDER_CONSTANT, value=0)
+            h, w = img.shape
+
+        # Random patch location
+        if random.random() < 0.5:
+            cy, cx = h // 2, w // 2
+            jitter = ps // 4
+            y = max(0, min(h - ps, cy - ps // 2 + random.randint(-jitter, jitter)))
+            x = max(0, min(w - ps, cx - ps // 2 + random.randint(-jitter, jitter)))
+        else:
+            y = random.randint(0, h - ps)
+            x = random.randint(0, w - ps)
+
+        ip = img[y:y+ps, x:x+ps].astype(np.float32) / 255.0
+        mp = msk[y:y+ps, x:x+ps]
+        wp = wgt[y:y+ps, x:x+ps]
+        
+        # === START ADVANCED AUGMENTATION ===
+
+        # 1. Intensity Augmentation
+        if self.use_intensity_augmentation: 
+            if random.random() < 0.8:
+                alpha = random.uniform(0.9, 1.1)
+                ip = np.clip(ip * alpha, 0.0, 1.0)
+                noise = np.random.normal(0, random.uniform(0.005, 0.015), ip.shape).astype(np.float32)
+                ip = np.clip(ip + noise, 0.0, 1.0)
+
+        # 2. Random Scaling (Scale Jitter)
+        if self.use_scale_jitter: 
+            if random.random() < 0.3:
+                scale_factor = random.uniform(0.7, 1.0)
+                new_size = (int(ps * scale_factor), int(ps * scale_factor))
+                ip_scaled = cv2.resize(ip, new_size, interpolation=cv2.INTER_LINEAR)
+                mp_scaled = cv2.resize(mp.astype(np.uint8), new_size, interpolation=cv2.INTER_NEAREST)
+                wp_scaled = cv2.resize(wp, new_size, interpolation=cv2.INTER_LINEAR)
+
+                target_h, target_w = ps, ps
+                pad_h = target_h - ip_scaled.shape[0]
+                pad_w = target_w - ip_scaled.shape[1]
+
+                if pad_h >= 0 and pad_w >= 0:
+                    ip = cv2.copyMakeBorder(ip_scaled, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT_101)
+                    mp = cv2.copyMakeBorder(mp_scaled, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=0)
+                    wp = cv2.copyMakeBorder(wp_scaled, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=0)
+        
+        # 3. Geometric Augmentation
+        if self.use_geometric_augmentation:
+            if random.random() < 0.5:
+                ip = np.flip(ip, axis=1).copy()
+                mp = np.flip(mp, axis=1).copy()
+                wp = np.flip(wp, axis=1).copy()
+            if random.random() < 0.5:
+                ip = np.flip(ip, axis=0).copy()
+                mp = np.flip(mp, axis=0).copy()
+                wp = np.flip(wp, axis=0).copy()
+            k = random.randint(0, 3)
+            if k > 0:
+                ip = np.rot90(ip, k=k).copy()
+                mp = np.rot90(mp, k=k).copy()
+                wp = np.rot90(wp, k=k).copy()
+        
+        # === END ADVANCED AUGMENTATION ===
+
+        if self.norm_mode == "dataset":
+            ip = (ip - self.mean_val) / (self.std_val + 1e-6)
+        elif self.norm_mode == "zscore":
+            ip = (ip - ip.mean()) / (ip.std() + 1e-6)
+
+        ip = torch.tensor(ip).unsqueeze(0)
+        mp = torch.tensor(mp).unsqueeze(0).float()
+        wp = torch.tensor(wp).unsqueeze(0).float()
+        
+        return ip, mp, wp # Returns 3 tensors: Image, Mask, Weight
+
+# ======================================================================================
+# Losses & helpers 
+# ======================================================================================
+
+def dice_loss(logits, targets, smooth=1e-6):
+    """Computes the 1 - Dice Score for batch-averaged loss."""
+    probs = torch.sigmoid(logits)
+    inter = (probs * targets).sum(dim=(2,3))
+    dice = (2*inter + smooth) / (probs.sum(dim=(2,3)) + targets.sum(dim=(2,3)) + smooth)
+    return 1 - dice.mean()
+
+def compute_dice_and_iou(logits, target, threshold=0.5, eps=1e-6):
+    """Computes Dice and IoU for evaluation metrics."""
+    probs = torch.sigmoid(logits)
+    preds = (probs > threshold).float()
+    inter = (preds * target).sum(dim=(2, 3))
+    union = (preds + target).sum(dim=(2, 3)) - inter
+    dice = (2 * inter + eps) / (preds.sum(dim=(2, 3)) + target.sum(dim=(2, 3)) + eps)
+    iou  = (inter + eps) / (union + eps)
+    return dice.mean().item(), iou.mean().item()  
+
+def get_boundary_targets(gt_mask, radius=1):
+    """
+    Generates a boundary map from the ground truth mask using dilation/erosion.
+    """
+    gt_np = gt_mask.detach().cpu().numpy().astype(np.uint8)
+    B = []
+    # Use RECT kernel for dilation/erosion
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (2*radius+1, 2*radius+1))
+    for m in gt_np:
+        m = m[0]
+        # Dilate and Erode to get a boundary
+        dil = cv2.dilate(m, k, iterations=1)
+        ero = cv2.erode(m, k, iterations=1)
+        boundary = dil - ero
+        # Soften the boundary slightly by Gaussian blur to encourage learning
+        boundary = cv2.GaussianBlur(boundary.astype(np.float32), (3,3), 0)
+        boundary /= np.maximum(boundary.max(), 1e-6)
+        B.append(boundary)
+    return torch.tensor(np.array(B))[:,None].float().to(gt_mask.device)
+
+
+# ======================================================================================
+# clDice Metric Function (NEW)
+# ======================================================================================
+def compute_cl_dice(pred_binary, target_binary, eps=1e-6):
+    """
+    Computes the clDice (skeleton-based Dice) metric.
+    Expects pred_binary and target_binary to be numpy arrays (H, W) with values 0 or 1.
+    """
+    try:
+        # Skeletonize
+        skel_pred = skeletonize(pred_binary > 0).astype(np.float32)
+        skel_gt = skeletonize(target_binary > 0).astype(np.float32)
+
+        # Compute Tprec (Topology Precision)
+        tprec_num = (skel_pred * target_binary).sum()
+        tprec_den = skel_pred.sum()
+        tprec = (tprec_num + eps) / (tprec_den + eps)
+
+        # Compute Tsens (Topology Sensitivity)
+        tsens_num = (skel_gt * pred_binary).sum()
+        tsens_den = skel_gt.sum()
+        tsens = (tsens_num + eps) / (tsens_den + eps)
+
+        cl_dice = (2. * tprec * tsens) / (tprec + tsens + eps)
+        return float(cl_dice)
+    except Exception as e:
+        # Handle cases where skeletonization might fail or sums are zero
+        # print(f"Warning: clDice calculation failed: {e}")
+        return 0.0 # Return 0 
+
+# ======================================================================================
+#  Training Loop with Loss Toggle
+# ======================================================================================
+def train_model(model, train_loader, val_loader,
+                num_epochs=100, patience=10, device='cuda',
+                save_dir='checkpoints', lr=3e-4,
+                csv_logfile="training_log.csv",
+                centerline_power=4.0, 
+                # Loss Toggle: Controls loss complexity 
+                use_structural_loss=True, 
+                # Structural Loss Parameters
+                boundary_lambda=0.5, boundary_radius=1, 
+                centerline_head_lambda=0.5,
+                # --- ADDED FOR SINGLE-TASK STRUCTURAL LOSS ---
+                use_mtl_mode=True
+                ):
+
+    os.makedirs(save_dir, exist_ok=True)
+    model = model.to(device)
+
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=0.0)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=3, verbose=True
+    )
+
+    best_val = float('inf')
+    patience_ctr = 0
+
+    with open(csv_logfile, 'w', newline='') as f:
+        csv.writer(f).writerow(["Epoch", "TrainLoss", "ValLoss", "ValDice", "ValIoU", "LR"])  
+
+    def calculate_total_loss(mask_logits, boundary_logits, centerline_logits, y, w):
+        """
+        Calculates the total loss based on the loss toggle and the available logits.
+        """
+        # 1. Base Segmentation Loss (BCE + Dice) - Always calculated
+        loss = bce(mask_logits, y) + dice_loss(mask_logits, y)
+
+        # 2. Structural Loss Components (Boundary and Centerline)
+        if use_structural_loss:
+            
+            if use_mtl_mode:
+                # --- MTL Mode: Use dedicated heads ---
+                # Check if logits for structural guidance were built and returned by the model
+                if boundary_logits is not None and centerline_logits is not None:
+                    # Multi-Task Loss: Loss from dedicated heads
+                    
+                    # Boundary Head Loss
+                    gt_boundary = get_boundary_targets(y, radius=boundary_radius)
+                    loss_boundary_head = bce(boundary_logits, gt_boundary)
+                    loss += boundary_lambda * loss_boundary_head
+
+                    # Centerline Head Loss
+                    loss_centerline_head = F.binary_cross_entropy_with_logits(centerline_logits, w, reduction="mean")
+                    loss += centerline_head_lambda * loss_centerline_head
+                else:
+                    # Log warning if structural loss is ON but heads weren't built
+                    print("Warning: Structural loss requested but MTL heads are missing. Falling back to BCE+Dice.")
+            
+            else:
+                # --- Single-Task Mode: Apply losses to main mask_logits ---
+                # Boundary Loss (on main mask)
+                gt_boundary = get_boundary_targets(y, radius=boundary_radius)
+                loss_boundary_head = bce(mask_logits, gt_boundary)
+                loss += boundary_lambda * loss_boundary_head
+                
+                # Centerline Loss (on main mask)
+                loss_centerline_head = F.binary_cross_entropy_with_logits(mask_logits, w, reduction="mean")
+                loss += centerline_head_lambda * loss_centerline_head
+
+        return loss
+
+    for epoch in range(num_epochs):
+
+        # ---- Training ----
+        model.train()
+        tr_loss, n_tr = 0.0, 0
+        
+        for batch in train_loader:
+            # EXPECTING 3 outputs: x (image), y (mask), w (weight/centerline)
+            x, y, w = batch
+            x, y, w = x.to(device), y.to(device), w.to(device)
+            
+            optimizer.zero_grad()
+            
+            # Model call: returns 3 logits (auxiliary may be None)
+            mask_logits, boundary_logits, centerline_logits = model(x)
+            
+            # Total Loss Calculation
+            loss = calculate_total_loss(mask_logits, boundary_logits, centerline_logits, y, w)
+            
+            loss.backward()
+            optimizer.step()
+            tr_loss += loss.item() * x.size(0)
+            n_tr += x.size(0)
+
+        tr_loss /= max(n_tr, 1)
+
+        # ---- Validation ----
+        model.eval()
+        va_loss, n_va = 0.0, 0
+        dices, ious = [], []
+
+        with torch.no_grad():
+            for batch in val_loader:
+                # EXPECTING 3 outputs: x (image), y (mask), w (weight/centerline)
+                x, y, w = batch
+                x, y, w = x.to(device), y.to(device), w.to(device)
+
+                # Model call: returns 3 logits
+                mask_logits, boundary_logits, centerline_logits = model(x)
+                
+                # Total Loss Calculation (same as train)
+                loss = calculate_total_loss(mask_logits, boundary_logits, centerline_logits, y, w)
+
+                va_loss += loss.item() * x.size(0)
+                n_va += x.size(0)
+
+                # Evaluate metrics using only the segmentation mask (y)
+                d, i = compute_dice_and_iou(mask_logits, y)
+                dices.append(d)
+                ious.append(i)
+
+        if n_va > 0:
+            va_loss /= n_va
+            md_val, mi_val = float(np.mean(dices)), float(np.mean(ious))
+        else:
+            va_loss, md_val, mi_val = float('inf'), 0.0, 0.0
+            
+        lr_now = optimizer.param_groups[0]['lr']
+
+        print(f"Epoch {epoch+1}: Train {tr_loss:.4f} | Val {va_loss:.4f} | "
+              f"Val Dice {md_val:.4f} | Val IoU {mi_val:.4f} | LR {lr_now:.6f}")
+
+        with open(csv_logfile, 'a', newline='') as f:
+            csv.writer(f).writerow([
+                epoch+1, tr_loss, va_loss, md_val, mi_val, lr_now
+            ])
+
+        # ---- Early stopping ----
+        scheduler.step(va_loss)
+        if va_loss < best_val:
+            best_val = va_loss
+            patience_ctr = 0
+            torch.save(model.state_dict(), os.path.join(save_dir, 'unet_best.pth'))
+            print(f"--> Epoch {epoch+1}: best val loss {best_val:.6f} (saved)")
+        else:
+            patience_ctr += 1
+            print(f"--> Epoch {epoch+1}: no improv ({patience_ctr}/{patience})")
+            if patience_ctr >= patience:
+                print("Early stopping (val loss did not improve).")
+                break
+
+    torch.save(model.state_dict(), os.path.join(save_dir, 'unet_final.pth'))
+
+
+# ======================================================================================
+# Test-time sliding-window (Updated for Multi-Head output)
+# ======================================================================================
+@torch.no_grad()
+def sliding_window_inference(model, image_uint8, patch_size=128, stride=128, device='cuda'):
+    """Performs sliding window inference, returning predictions for all three potential heads."""
+    model.eval()
+    H, W = image_uint8.shape
+    ps = int(patch_size)
+    st = int(stride)
+
+    # Pad image
+    H_start_points = (H - ps) // st + 1
+    W_start_points = (W - ps) // st + 1
+    
+    H2 = ps + H_start_points * st if H_start_points > 0 else ps
+    W2 = ps + W_start_points * st if W_start_points > 0 else ps
+    
+    pad_h = H2 - H
+    pad_w = W2 - W
+    
+    img = image_uint8
+    if pad_h > 0 or pad_w > 0:
+        img = cv2.copyMakeBorder(image_uint8, 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT_101)
+    H2, W2 = img.shape
+
+    prob_full = np.zeros((H2, W2), dtype=np.float32)
+    boundary_full = np.zeros((H2, W2), dtype=np.float32)
+    centerline_full = np.zeros((H2, W2), dtype=np.float32)
+    count_full = np.zeros((H2, W2), dtype=np.float32)  
+    
+    # Flag to track if auxiliary heads were actually used
+    aux_heads_available = False
+
+    for y in range(0, H2, st):
+        y_start = y
+        if y + ps > H2: 
+            if y < H2:
+                y_start = H2 - ps
+            else:
+                continue
+
+        for x in range(0, W2, st):
+            x_start = x
+            if x + ps > W2:
+                if x < W2:
+                    x_start = W2 - ps
+                else:
+                    continue
+
+            patch = img[y_start:y_start+ps, x_start:x_start+ps].astype(np.float32) / 255.0
+            
+            x_t = torch.tensor(patch).unsqueeze(0).unsqueeze(0).to(device)
+
+            # Model call: returns 3 logits (auxiliary may be None)
+            mask_logits, boundary_logits, centerline_logits = model(x_t)
+            
+            # Accumulate mask prediction
+            prob = torch.sigmoid(mask_logits)[0,0].cpu().numpy()
+            prob_full[y_start:y_start+ps, x_start:x_start+ps] += prob
+            count_full[y_start:y_start+ps, x_start:x_start+ps] += 1.0
+            
+            # Accumulate auxiliary predictions only if available
+            if boundary_logits is not None and centerline_logits is not None:
+                aux_heads_available = True
+                
+                boundary_prob = torch.sigmoid(boundary_logits)[0,0].cpu().numpy()
+                boundary_full[y_start:y_start+ps, x_start:x_start+ps] += boundary_prob
+                
+                centerline_prob = torch.sigmoid(centerline_logits)[0,0].cpu().numpy()
+                centerline_full[y_start:y_start+ps, x_start:x_start+ps] += centerline_prob
+
+
+    # Average overlapping predictions for mask
+    prob_full /= np.maximum(count_full, 1e-12)
+    
+    # Process auxiliary predictions conditionally
+    if aux_heads_available:
+        boundary_full /= np.maximum(count_full, 1e-12)
+        centerline_full /= np.maximum(count_full, 1e-12)
+    else:
+        # If heads were not built, set results to None
+        boundary_full = None
+        centerline_full = None
+
+    # Crop back to original size
+    prob_full = prob_full[:H, :W]
+    if boundary_full is not None: 
+        boundary_full = boundary_full[:H, :W]
+        pred_boundary = (boundary_full > 0.5).astype(np.uint8)
+    else:
+        pred_boundary = None
+        
+    if centerline_full is not None:
+        centerline_full = centerline_full[:H, :W]
+        pred_centerline = (centerline_full > 0.5).astype(np.uint8)
+    else:
+        pred_centerline = None
+    
+    pred_mask = (prob_full > 0.5).astype(np.uint8)
+
+    # Note: Inference returns binary/prob for auxiliary heads only if they were built.
+    return pred_mask, prob_full, pred_boundary, boundary_full, pred_centerline, centerline_full
+
+# ======================================================================================
+# Generalized Post-Training Evaluation (Updated for 500-point ROC CSV)
+# ======================================================================================
+def evaluate_full_images(model, image_dir, mask_dir, file_list, device, save_dir, prefix,
+                         patch_size=256, stride=128, invert=True,
+                         clip_limit=8.0, tile_size=4): 
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Create subdirectories
+    pred_mask_dir        = os.path.join(save_dir, "pred_masks")
+    pred_boundary_dir    = os.path.join(save_dir, "pred_boundaries")
+    pred_centerline_dir = os.path.join(save_dir, "pred_centerlines")
+    gt_mask_dir          = os.path.join(save_dir, "gt_masks")
+    overlay_dir          = os.path.join(save_dir, "overlays")
+    
+    if prefix == 'test':
+        for d in [pred_mask_dir, gt_mask_dir, overlay_dir]:
+            os.makedirs(d, exist_ok=True)
+
+    model.eval()
+
+    # Lists for per-image scalar metrics
+    dices, ious, cl_dices, aucs, mccs = [], [], [], [], []
+    fprs, fnrs, recalls, precisions = [], [], [], []
+    accuracies, specificities = [], []
+    
+    # Lists for GLOBAL ROC calculation (accumulate all pixels)
+    all_gt_flat = []
+    all_probs_flat = []
+
+    eps = 1e-12 
+
+    # Per-image metrics file header
+    per_img_file = os.path.join(save_dir, f"metrics_{prefix}_per_image.txt")
+    with open(per_img_file, 'w') as f:
+        f.write("Filename,IoU,Dice,clDice,F1_Score,Precision,Recall,Specificity,Accuracy,FPR,FNR,MCC,AUC\n")
+
+    print(f"\nStarting final evaluation on FULL {prefix.upper()} Images...")
+
+    for fn in file_list:
+        try:
+            current_fn = str(fn)
+
+            # 1. Preprocess Image and Load GT Mask
+            img_rgb = Image.open(Path(image_dir)/current_fn).convert('RGB')
+            image_uint8 = preprocess_green_clahe(img_rgb, invert=invert,
+                                                 clip_limit=clip_limit, tile_size=tile_size)
+
+            gt_path = Path(mask_dir)/current_fn
+            if not gt_path.exists():
+                stem = gt_path.stem
+                if (Path(mask_dir) / (stem + '.png')).exists():
+                    gt_path = Path(mask_dir) / (stem + '.png')
+                elif (Path(mask_dir) / (stem + '.tif')).exists():
+                    gt_path = Path(mask_dir) / (stem + '.tif')
+
+            gt = np.array(Image.open(gt_path).convert('L'))
+            gt_binary = (gt > 127).astype(np.uint8)
+
+            # 2. Inference
+            pred_mask, prob_mask, pred_boundary, prob_boundary, pred_centerline, prob_centerline = sliding_window_inference(
+                model, image_uint8,
+                patch_size=patch_size, stride=stride, device=device,
+            )
+            
+            # --- ACCUMULATE DATA FOR GLOBAL ROC ---
+            all_gt_flat.append(gt_binary.flatten())
+            all_probs_flat.append(prob_mask.flatten())
+
+            # 3. Core confusion terms
+            tp = int((pred_mask & gt_binary).sum())
+            fp = int((pred_mask & (1 - gt_binary)).sum())
+            fn = int(((1 - pred_mask) & gt_binary).sum())
+            tn = int(((1 - pred_mask) & (1 - gt_binary)).sum())
+
+            total_pixels = tp + fp + tn + fn
+            if total_pixels == 0: continue
+
+            # 4. Derived Metrics
+            dice = (2. * tp + eps) / (2. * tp + fp + fn + eps)
+            iou  = (tp + eps) / (tp + fp + fn + eps)
+            f1   = dice
+            cl_dice_val = compute_cl_dice(pred_mask, gt_binary, eps=eps)
+
+            recall    = (tp + eps) / (tp + fn + eps)
+            precision = (tp + eps) / (tp + fp + eps)
+            specificity = (tn + eps) / (tn + fp + eps)
+            accuracy = (tp + tn + eps) / (total_pixels + eps)
+            fpr = (fp + eps) / (fp + tn + eps)
+            fnr = (fn + eps) / (fn + tp + eps)
+
+            try:
+                mcc = matthews_corrcoef(gt_binary.flatten(), pred_mask.flatten())
+            except ValueError:
+                mcc = 0.0
+
+            try:
+                if np.sum(gt_binary) > 0 and np.sum(1 - gt_binary) > 0:
+                    auc_val = roc_auc_score(gt_binary.flatten(), prob_mask.flatten())
+                else:
+                    auc_val = np.nan
+            except ValueError:
+                auc_val = np.nan
+
+            # 5. Collect Metrics
+            dices.append(dice); ious.append(iou); cl_dices.append(cl_dice_val)
+            aucs.append(auc_val); mccs.append(mcc)
+            fprs.append(fpr); fnrs.append(fnr)
+            recalls.append(recall); precisions.append(precision)
+            accuracies.append(accuracy); specificities.append(specificity)
+
+            # 6. Log per-image metrics
+            with open(per_img_file, 'a') as f:
+                f.write(f"{current_fn},{iou:.4f},{dice:.4f},{cl_dice_val:.4f},{f1:.4f},{precision:.4f},{recall:.4f},{specificity:.4f},{accuracy:.4f},{fpr:.4f},{fnr:.4f},{mcc:.4f},{auc_val:.4f}\n")
+                
+            # 7. Visualization (test only)
+            if prefix == 'test':
+                Image.fromarray((pred_mask*255).astype(np.uint8)).save(
+                    os.path.join(pred_mask_dir, f"pred_{Path(current_fn).stem}.png"))
+                Image.fromarray((gt*255).astype(np.uint8)).save(
+                    os.path.join(gt_mask_dir, f"gt_{Path(current_fn).stem}.png"))
+
+                if pred_boundary is not None:
+                    os.makedirs(pred_boundary_dir, exist_ok=True)
+                    Image.fromarray((pred_boundary*255).astype(np.uint8)).save(
+                        os.path.join(pred_boundary_dir, f"boundary_{Path(current_fn).stem}.png"))
+                if pred_centerline is not None:
+                    os.makedirs(pred_centerline_dir, exist_ok=True)
+                    Image.fromarray((pred_centerline*255).astype(np.uint8)).save(
+                        os.path.join(pred_centerline_dir, f"centerline_{Path(current_fn).stem}.png"))
+
+                # Overlay
+                rgb = np.stack([image_uint8]*3, axis=-1)
+                overlay = rgb.copy()
+                if pred_boundary is not None:
+                    overlay[pred_boundary > 0] = [0, 0, 255]
+                gt_indices = gt > 0
+                overlay[gt_indices] = [0, 255, 0]
+                fp_indices = (pred_mask > 0) & (gt == 0)
+                overlay[fp_indices] = [255, 0, 0]
+                tp_indices = (pred_mask > 0) & (gt > 0)
+                overlay[tp_indices] = [255, 255, 0]
+                Image.fromarray(overlay).save(
+                    os.path.join(overlay_dir, f"overlay_{Path(current_fn).stem}.png"))
+
+        except Exception as e:
+            print(f"Error evaluating {prefix} image {fn}: {e}")
+            
+    # 8. Summary Metrics
+    valid_aucs = [a for a in aucs if not np.isnan(a)]
+    mean_iou  = float(np.mean(ious)) if ious else 0.0
+    mean_dice = float(np.mean(dices)) if dices else 0.0
+    mean_cl_dice = float(np.mean(cl_dices)) if cl_dices else 0.0
+    mean_auc  = float(np.mean(valid_aucs)) if valid_aucs else 0.0
+    mean_acc = float(np.mean(accuracies)) if accuracies else 0.0
+
+    # -------------------------------------------------------------------------
+    # GLOBAL ROC CURVE CALCULATION & PLOTTING (MODIFIED FOR 500 POINTS)
+    # -------------------------------------------------------------------------
+    roc_auc_global = 0.0
+    if len(all_gt_flat) > 0:
+        print("Calculating Global ROC Curve...")
+        # Concatenate all pixels
+        y_true_all = np.concatenate(all_gt_flat)
+        y_scores_all = np.concatenate(all_probs_flat)
+        
+        # Calculate full curve
+        fpr_global, tpr_global, thresholds = roc_curve(y_true_all, y_scores_all)
+        roc_auc_global = auc(fpr_global, tpr_global)
+        
+        # --- NEW LOGIC START: Interpolate to exactly 500 points ---
+        # Generate 500 evenly spaced FPR points from 0 to 1
+        target_fpr = np.linspace(0, 1, 500)
+        
+        # Interpolate TPR and Thresholds to match the target FPR points
+        # np.interp works because FPR is monotonically increasing
+        interp_tpr = np.interp(target_fpr, fpr_global, tpr_global)
+        interp_thresh = np.interp(target_fpr, fpr_global, thresholds)
+        
+        roc_csv_path = os.path.join(save_dir, f"roc_curve_data_{prefix}_500points.csv")
+        with open(roc_csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(["FPR", "TPR", "Threshold"])
+            for f_val, t_val, th_val in zip(target_fpr, interp_tpr, interp_thresh):
+                writer.writerow([f_val, t_val, th_val])
+        print(f"ROC Curve data (500 points) saved to: {roc_csv_path}")
+        # --- NEW LOGIC END ---
+
+        # Plot using the full high-res curve for the image
+        plt.figure(figsize=(8, 8))
+        plt.plot(fpr_global, tpr_global, color='darkorange', lw=2, 
+                 label=f'ROC curve (AUC = {roc_auc_global:.4f})')
+        plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+        plt.xlim([0.0, 1.0])
+        plt.ylim([0.0, 1.05])
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.title(f'ROC Curve - {prefix.upper()} Set')
+        plt.legend(loc="lower right")
+        plt.grid(True, linestyle='--', alpha=0.5)
+        
+        roc_plot_path = os.path.join(save_dir, f"ROC_Curve_Plot_{prefix}.png")
+        plt.savefig(roc_plot_path, dpi=300)
+        plt.close()
+        print(f"ROC Curve plot saved to: {roc_plot_path}")
+
+    summary_file = os.path.join(save_dir, f"metrics_{prefix}_summary.txt")
+    with open(summary_file, 'w') as f:
+        f.write(f"--- Final {prefix.upper()} Set Evaluation ---\n")
+        f.write(f"Mean IoU: {mean_iou:.4f}\n")
+        f.write(f"Mean Dice: {mean_dice:.4f}\n")
+        f.write(f"Mean clDice: {mean_cl_dice:.4f}\n")
+        f.write(f"Mean Accuracy: {mean_acc:.4f}\n")
+        f.write(f"Mean AUC (Per-Image Avg): {mean_auc:.4f}\n")
+        if len(all_gt_flat) > 0:
+             f.write(f"Global AUC (All pixels aggregated): {roc_auc_global:.4f}\n")
+
+    print(f"Final {prefix} evaluation done. Global AUC: {roc_auc_global:.4f}")
+    return mean_dice, mean_iou
+
+
+# ======================================================================================
+# Main (CONFIG DRIVEN)
+# ======================================================================================
+if __name__ == "__main__":
+    set_seed(42)
+
+    # --------------------------
+    # Paths (Linked to Config)
+    # --------------------------
+    # Ensure these paths exist or the user edits Config.DATA_ROOT
+    data_root = Config.DATASET_ROOT
+    train_val_image_dir = os.path.join(data_root, 'Train', 'images')
+    train_val_mask_dir  = os.path.join(data_root, 'Train', 'mask')
+    test_image_dir      = os.path.join(data_root, 'Test', 'images')
+    test_mask_dir       = os.path.join(data_root, 'Test', 'mask')
+
+    # Check for paths
+    if not os.path.exists(train_val_image_dir):
+        raise FileNotFoundError(f"Train Image Directory not found: {train_val_image_dir}. \nPlease check Config.DATASET_ROOT and ensure it contains Train/images")
+    if not os.path.exists(train_val_mask_dir):
+        raise FileNotFoundError(f"Train Mask Directory not found: {train_val_mask_dir}")
+        
+    # Auto-Split Logic (If Test Dir is None, we split from Train)
+    if test_image_dir is None:
+        print("Test Directory not provided. Will split Train data for testing.")
+        test_image_dir = train_val_image_dir # Just for safety, we won't use it directly
+        test_mask_dir = train_val_mask_dir
+        perform_manual_split = True
+    else:
+        perform_manual_split = False
+
+    # --------------------------
+    # Hyperparams (Linked to Config)
+    # --------------------------
+    patch_size      = Config.PATCH_SIZE
+    batch_size      = Config.BATCH_SIZE
+    lr              = Config.LEARNING_RATE
+    num_epochs      = Config.EPOCHS
+    
+    # --------------------------
+    # Architecture Toggles (Linked to Config)
+    # --------------------------
+    use_lsam        = Config.USE_LMSA_MODULE
+    use_mtl_mode    = Config.USE_MTL_HEAD
+    
+    # Derived Toggles
+    build_mtl_heads     = use_mtl_mode
+    use_structural_loss = use_mtl_mode  # If we build heads, we train them
+    
+    # --------------------------
+    # LSAM Config
+    # --------------------------
+    lsam_K          = Config.LMSA_K
+    lsam_sigma_min  = Config.LMSA_SIGMA_MIN
+    lsam_sigma_max  = Config.LMSA_SIGMA_MAX
+    # Topology mode is hardcoded here as requested (no need in Config)
+    lsam_topology_mode = "scalar"
+    dropout_p=0.3
+
+    # Augmentation Toggles (Hardcoded for stability, but can be moved to config)
+    use_geometric_augmentation = True   
+    use_intensity_augmentation = True       
+    use_scale_jitter           = False
+    
+    # Other fixed params
+    patches_per_image = 50
+    stride            = 128
+    base_channels     = 64  
+    train_ratio       = 0.8
+    invert            = False 
+    clip_limit        = 8.0
+    tile_size         = 4
+    num_workers       = 4
+    patience          = 10
+    centerline_power  = 0.1 
+    norm_mode         = "none" 
+    
+    # --------------------------
+    # Setup
+    # --------------------------
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    
+    # Update output directory name based on mode
+    if use_mtl_mode and use_structural_loss:
+        mode = "MTL_Full"
+    elif use_mtl_mode and not use_structural_loss:
+        mode = "MTL_Arch_Only"
+    elif not use_mtl_mode and use_structural_loss:
+        mode = "Plain_StructLoss"
+    else:
+        mode = "Plain_BaseLoss"
+    if not use_lsam:
+        mode += "_NoLMSA"
+        
+    results_base_dir = f"unet_lsam_{mode}_results_{timestamp}"
+    
+    save_dir = f"{results_base_dir}/checkpoints"
+    os.makedirs(results_base_dir, exist_ok=True)
+    os.makedirs(os.path.join(results_base_dir, "train_evaluation"), exist_ok=True)
+    os.makedirs(os.path.join(results_base_dir, "val_evaluation"), exist_ok=True)
+    os.makedirs(os.path.join(results_base_dir, "test_predictions"), exist_ok=True)
+
+    # --------------------------
+    # File Splitting Logic
+    # --------------------------
+    all_files = [f for f in os.listdir(train_val_image_dir)
+                 if f.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff"))]
+    random.shuffle(all_files)
+    
+    if perform_manual_split:
+        # Split into Train (70%), Val (10%), Test (20%) from the single folder
+        n_total = len(all_files)
+        n_train = int(n_total * 0.7)
+        n_val   = int(n_total * 0.1)
+        
+        train_files = all_files[:n_train]
+        val_files   = all_files[n_train : n_train+n_val]
+        test_files  = all_files[n_train+n_val:]
+        print(f"Auto-Split enabled: Train={len(train_files)}, Val={len(val_files)}, Test={len(test_files)}")
+    else:
+        # Standard Split: Train/Val from TRAIN_DIR, Test from TEST_DIR
+        n_train = int(train_ratio * len(all_files))
+        train_files = all_files[:n_train]
+        val_files   = all_files[n_train:]
+        
+        test_files = [f for f in os.listdir(test_image_dir)
+                      if f.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff"))]
+
+    # --------------------------
+    # Dataset mean/std (optional)
+    # --------------------------
+    mean_val, std_val = 0.0, 1.0
+    if norm_mode == "dataset":
+        print("Computing dataset mean/std on TRAIN split (after CLAHE+invert)...")
+        mean_val, std_val = compute_dataset_mean_std(
+            train_val_image_dir, train_files, invert=invert, clip_limit=clip_limit, tile_size=tile_size
+        )
+        print(f"Dataset mean/std: mean={mean_val:.5f}, std={std_val:.5f}")
+
+    # --------------------------
+    # Data loaders
+    # --------------------------
+    train_ds = PatchSegmentationDataset(
+        train_val_image_dir, train_val_mask_dir, train_files,
+        patch_size=patch_size, patches_per_image=patches_per_image, invert=invert,
+        clip_limit=clip_limit, tile_size=tile_size,
+        norm_mode=norm_mode, mean_val=mean_val, std_val=std_val,
+        centerline_power=centerline_power, 
+        use_geometric_augmentation=use_geometric_augmentation,      
+        use_intensity_augmentation=use_intensity_augmentation,      
+        use_scale_jitter=use_scale_jitter,                  
+    )
+    val_ds = PatchSegmentationDataset(
+        train_val_image_dir, train_val_mask_dir, val_files,
+        patch_size=patch_size, patches_per_image=patches_per_image, invert=invert,
+        clip_limit=clip_limit, tile_size=tile_size,
+        norm_mode=norm_mode, mean_val=mean_val, std_val=std_val,
+        centerline_power=centerline_power, 
+        use_geometric_augmentation=False,   
+        use_intensity_augmentation=False,   
+        use_scale_jitter=False,                 
+    )
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  num_workers=num_workers, pin_memory=True)
+    val_loader   = DataLoader(val_ds,     batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+
+    print(f"[Patch Datasets] Train imgs: {len(train_files)} | Val imgs: {len(val_files)}")
+    print(f"[Expanded] Train samples: {len(train_ds)} | Val samples: {len(val_ds)}")
+
+    # --------------------------
+    # Model Initialization (Updated)
+    # --------------------------
+    unet_base_kwargs = {
+        "in_ch": 1, "out_ch": 1, "base": base_channels,
+        "use_lsam": use_lsam,
+        "K": lsam_K, "sigma_min": lsam_sigma_min, "sigma_max": lsam_sigma_max, 
+        "black_ridges": True,
+        "lsam_use_dropout_gate": False, "lsam_dropout_p": 0.3,
+        "lsam_gate_hidden": 64,
+        "lsam_use_multichannel_gate": True, 
+        "lsam_use_multiplicative_attention": False,
+        "lsam_topology_mode": lsam_topology_mode,
+        "dropout_p": dropout_p,
+        "build_mtl_heads": build_mtl_heads # ARCHITECTURE TOGGLE
+    }
+
+    model = UNetLSAM_Boundary(**unet_base_kwargs)
+    
+    # Report configuration
+    if use_mtl_mode and use_structural_loss: 
+        print(f"Mode: Full MTL (Multi-Head Architecture + Structural MTL Loss Active).")
+        print(f"  Loss Weights: L_boundary({Config.LAMBDA_BOUNDARY}) | L_centerline({Config.LAMBDA_CENTERLINE}).")
+    elif use_mtl_mode and not use_structural_loss: 
+        print(f"Mode: MTL Architecture (Multi-Head) with PLAIN Loss (BCE+Dice on mask head only).")
+    elif not use_mtl_mode and use_structural_loss:
+        print(f"Mode: Single-Task Structural Loss (Plain U-Net + Combined Loss Active).")
+    else: 
+        print("Mode: Plain U-Net (Single-Head Architecture + BCE + Dice only).")
+
+    # --------------------------
+    # Train 
+    # --------------------------
+    train_model(
+        model, train_loader, val_loader,
+        num_epochs=num_epochs, patience=patience, device=device, lr=lr, save_dir=save_dir,
+        csv_logfile=os.path.join(results_base_dir, "training_log.csv"),
+        centerline_power=centerline_power,
+        # Loss Parameters
+        use_structural_loss=use_structural_loss, 
+        boundary_lambda=Config.LAMBDA_BOUNDARY, 
+        boundary_radius=1, 
+        centerline_head_lambda=Config.LAMBDA_CENTERLINE,
+        use_mtl_mode=use_mtl_mode 
+    )
+
+    # --------------------------
+    # Load Best Checkpoint for Final Evaluation on ALL splits
+    # --------------------------
+    best_pth = os.path.join(save_dir, 'unet_best.pth')
+    if os.path.exists(best_pth):
+        model.load_state_dict(torch.load(best_pth, map_location=device))
+        print("\nLoaded best checkpoint for final evaluation.")
+    else:
+        print("\nBest checkpoint not found; using final weights for evaluation.")
+
+    # --------------------------
+    # Final Evaluation on FULL Training Set
+    # --------------------------
+    evaluate_full_images(
+        model, train_val_image_dir, train_val_mask_dir, train_files, device=device,
+        save_dir=os.path.join(results_base_dir, "train_evaluation"),
+        prefix='train',
+        patch_size=patch_size, stride=stride, invert=invert,
+        clip_limit=clip_limit, tile_size=tile_size,
+    )
+     
+    # --------------------------
+    # Final Evaluation on FULL Validation Set
+    # --------------------------
+    evaluate_full_images(
+        model, train_val_image_dir, train_val_mask_dir, val_files, device=device,
+        save_dir=os.path.join(results_base_dir, "val_evaluation"),
+        prefix='val',
+        patch_size=patch_size, stride=stride, invert=invert,
+        clip_limit=clip_limit, tile_size=tile_size,
+    )
+
+    # --------------------------
+    # Final Evaluation on FULL Test Set
+    # --------------------------
+    if test_files:
+        evaluate_full_images(
+            model, test_image_dir, test_mask_dir, test_files, device=device,
+            save_dir=os.path.join(results_base_dir, "test_predictions"),
+            prefix='test',
+            patch_size=patch_size, stride=stride, invert=invert,
+            clip_limit=clip_limit, tile_size=tile_size,
+        )
