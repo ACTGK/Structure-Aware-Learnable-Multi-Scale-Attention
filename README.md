@@ -1,6 +1,4 @@
-# Structure-Aware-Learnable-Multi-Scale-Attention
-for reproducibility
-***
+
 
 # Structure-Aware Learnable Multi-Scale Attention for Retinal Vessel Analysis
 
